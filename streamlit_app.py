@@ -478,21 +478,21 @@ for i, (label, _) in enumerate(SYMBOLS.items()):
                         "Horizon": horizon_label,
                         "n": "—", "% up": "—",
                         "Median": "—",
-                        "90% band": "—",
+                        "Avg up / down": "—",
                     })
                 else:
                     if granularity_shown is None:
                         granularity_shown = gran
                     # Convert percentages to current-price points
                     median_pts = r["median_pct"] / 100 * last
-                    p5_pts = r["p5_pct"] / 100 * last
-                    p95_pts = r["p95_pct"] / 100 * last
+                    up_pts = r["avg_up_pct"] / 100 * last
+                    down_pts = r["avg_down_pct"] / 100 * last
                     rows.append({
                         "Horizon": horizon_label,
                         "n": f"{r['n']:,}",
                         "% up": f"{r['pct_up']:.0f}%",
                         "Median": f"{r['median_pct']:+.2f}%  ({median_pts:+.1f} pts)",
-                        "90% band": f"{r['p5_pct']:+.2f}% to {r['p95_pct']:+.2f}%  ({p5_pts:+.0f} to {p95_pts:+.0f} pts)",
+                        "Avg up / down": f"+{r['avg_up_pct']:.2f}% / {r['avg_down_pct']:.2f}%  (+{up_pts:.0f} / {down_pts:.0f} pts)",
                     })
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
             if granularity_shown:
