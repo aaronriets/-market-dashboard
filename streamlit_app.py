@@ -1,43 +1,40 @@
 """
-Market Pulse Dashboard - Phase 2
-Now with historical base rates from 3 years of CME futures data.
-For each instrument, classifies current state and looks up historical outcomes
-for matching conditions across multiple time horizons.
+Market Pulse Dashboard - Phase 2.1
+- Base rates in PERCENTAGE returns (normalizes across price levels over time)
+- Multi-window labels show actual clock times
+- Base rate table shows percentages with current-price point equivalents
 """
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import requests
 from streamlit_autorefresh import st_autorefresh
+import pytz
 
 # ============================================================
 # CONFIG
 # ============================================================
 st.set_page_config(page_title="Market Pulse", page_icon="📊", layout="wide")
 
-SYMBOLS = {
-    "ES": "ES=F",
-    "NQ": "NQ=F",
-    "YM": "YM=F",
-}
-
-# Map dashboard label → key in base_rates_5m.json
+SYMBOLS = {"ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F"}
 BASE_RATE_KEY = {"ES": "ES", "NQ": "MNQ", "YM": "MYM"}
 
 SESSION_BARS = 78
 BARS_1H = 12
 BARS_4H = 48
 
+ET = pytz.timezone("US/Eastern")
+
 st_autorefresh(interval=60_000, key="data_refresh")
 
 
 # ============================================================
-# BASE RATES (loaded once)
+# BASE RATES
 # ============================================================
 @st.cache_data
 def load_base_rates():
@@ -190,9 +187,12 @@ def window_stats(df, n_bars):
     open_p = win["Open"].iloc[0]
     if open_p == 0:
         return None
+    change = win["Close"].iloc[-1] - open_p
     return {
-        "change": win["Close"].iloc[-1] - open_p,
+        "change": change,
+        "change_pct": change / open_p * 100,
         "range": win["High"].max() - win["Low"].min(),
+        "start_time": win.index[0],
     }
 
 
@@ -204,7 +204,7 @@ def avg_daily_range(df_1d, lookback=20):
 
 
 # ============================================================
-# BASE RATE FEATURE COMPUTATION (must match offline script)
+# BASE RATE FEATURE COMPUTATION
 # ============================================================
 def current_macd_state(close):
     if len(close) < 30:
@@ -239,8 +239,8 @@ def current_session(df):
     ts = df.index[-1]
     if ts.tz is None:
         ts = ts.tz_localize("UTC")
-    et = ts.tz_convert("US/Eastern")
-    m = et.hour * 60 + et.minute
+    et_ts = ts.tz_convert(ET)
+    m = et_ts.hour * 60 + et_ts.minute
     if 4 * 60 <= m < 9 * 60 + 30:
         return 1
     if 9 * 60 + 30 <= m < 12 * 60:
@@ -282,10 +282,6 @@ def vol_label(v):
 
 
 def lookup_base_rate(market_key, state, horizon):
-    """
-    Try full 4-feature match first, fall back to 3-feature, then 2-feature.
-    Returns (data, granularity_label) or (None, None) if nothing available.
-    """
     if BASE_RATES is None or market_key not in BASE_RATES:
         return None, None
     m, c, s, v = state
@@ -294,12 +290,35 @@ def lookup_base_rate(market_key, state, horizon):
     k_3 = f"{m}|{c}|{s}"
     k_2 = f"{m}|{c}"
     if k_full in rates.get(f"h{horizon}_full", {}):
-        return rates[f"h{horizon}_full"][k_full], "full match (MACD+candle+session+vol)"
+        return rates[f"h{horizon}_full"][k_full], "full match"
     if k_3 in rates.get(f"h{horizon}_macd_candle_session", {}):
-        return rates[f"h{horizon}_macd_candle_session"][k_3], "3-feature match (MACD+candle+session)"
+        return rates[f"h{horizon}_macd_candle_session"][k_3], "3-feature fallback"
     if k_2 in rates.get(f"h{horizon}_macd_candle", {}):
-        return rates[f"h{horizon}_macd_candle"][k_2], "2-feature match (MACD+candle)"
+        return rates[f"h{horizon}_macd_candle"][k_2], "2-feature fallback"
     return None, None
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+def now_et():
+    return datetime.now(ET)
+
+
+def fmt_clock(dt):
+    """Format as '9:24 PM' style."""
+    if hasattr(dt, "tz_convert"):
+        dt = dt.tz_convert(ET)
+    elif dt.tzinfo is None:
+        dt = ET.localize(dt)
+    else:
+        dt = dt.astimezone(ET)
+    return dt.strftime("%-I:%M %p") if hasattr(dt, "strftime") else str(dt)
+
+
+def horizon_target_time(minutes_ahead):
+    target = now_et() + timedelta(minutes=minutes_ahead)
+    return fmt_clock(target)
 
 
 # ============================================================
@@ -357,9 +376,10 @@ def quick_summary(score, df_5m, df_1d, dur_str):
 # UI
 # ============================================================
 st.title("📊 Market Pulse")
+now_str = now_et().strftime("%I:%M %p ET")
 st.caption(
-    f"Updated {datetime.now().strftime('%H:%M:%S')}  •  Live data: yfinance (15-min delayed)  "
-    f"•  Base rates: 3 years CME data (Apr 2023 – May 2026)  •  Auto-refresh: 60s"
+    f"Updated {now_str}  •  Live data: yfinance (15-min delayed)  "
+    f"•  Base rates: 3 years CME data, percentage-normalized  •  Auto-refresh: 60s"
 )
 
 c1, c2, _ = st.columns([1, 1, 6])
@@ -373,7 +393,7 @@ with c2:
         st.success("Sent") if ok else st.error("Failed (check secrets)")
 
 if BASE_RATES is None:
-    st.warning("base_rates_5m.json not found — historical base rates disabled. Live data still works.")
+    st.warning("base_rates_5m.json not found — historical base rates disabled.")
 
 st.divider()
 
@@ -391,30 +411,24 @@ leans = {}
 for i, (label, _) in enumerate(SYMBOLS.items()):
     with cols[i]:
         st.header(label)
-        df_5m = data[label]["5m"]
-        df_1h = data[label]["1h"]
-        df_1d = data[label]["1d"]
+        df_5m = data[label]["5m"]; df_1h = data[label]["1h"]; df_1d = data[label]["1d"]
 
         if df_5m is None:
             st.error("No data")
             continue
 
-        # Score
         score = lean_score(df_5m, df_1h)
         leans[label] = score
         dur_bars, _ = trend_duration_bars(df_5m)
         dur_str = format_duration(dur_bars)
 
-        # Quick summary
         st.info(quick_summary(score, df_5m, df_1d, dur_str))
 
-        # Price
         last = df_5m["Close"].iloc[-1]
         prev_close = df_1d["Close"].iloc[-2] if df_1d is not None and len(df_1d) >= 2 else last
         change_pct = (last - prev_close) / prev_close * 100 if prev_close else 0.0
         st.metric("Price", f"{last:,.2f}", f"{change_pct:+.2f}%")
 
-        # Directional pressure
         if score >= 65:
             le, lw = "🟢", "Bullish"
         elif score <= 35:
@@ -426,7 +440,7 @@ for i, (label, _) in enumerate(SYMBOLS.items()):
         st.caption(f"State: {lw}  •  current state for {dur_str}")
 
         # ============================================
-        # HISTORICAL BASE RATES (NEW)
+        # HISTORICAL BASE RATES (percentage-based)
         # ============================================
         st.markdown("**📊 Historical base rates**")
         macd_s = current_macd_state(df_5m["Close"])
@@ -438,50 +452,72 @@ for i, (label, _) in enumerate(SYMBOLS.items()):
             st.write("—")
         else:
             st.caption(
-                f"Current state: **{macd_state_label(macd_s)}** MACD · "
+                f"State: **{macd_state_label(macd_s)}** MACD · "
                 f"**{candle_label(candle_s)}** candle · "
                 f"**{session_label(session_s)}** · "
-                f"**{vol_label(vol_s)}** volume"
+                f"**{vol_label(vol_s)}** vol"
             )
 
             market_key = BASE_RATE_KEY[label]
             state = (macd_s, candle_s, session_s, vol_s)
             granularity_shown = None
             rows = []
+            horizon_minutes_map = {"5m": 5, "15m": 15, "60m": 60, "240m": 240, "1440m": 1440}
             for horizon in ["5m", "15m", "60m", "240m", "1440m"]:
                 r, gran = lookup_base_rate(market_key, state, horizon)
+                target_clock = horizon_target_time(horizon_minutes_map[horizon])
+                horizon_label = {
+                    "5m": f"+5 min (by {target_clock})",
+                    "15m": f"+15 min (by {target_clock})",
+                    "60m": f"+1 hr (by {target_clock})",
+                    "240m": f"+4 hr (by {target_clock})",
+                    "1440m": f"+24 hr (by {target_clock})",
+                }[horizon]
                 if r is None:
-                    rows.append({"Horizon": horizon, "n": "—", "% up": "—", "Median": "—", "90% band": "—"})
+                    rows.append({
+                        "Horizon": horizon_label,
+                        "n": "—", "% up": "—",
+                        "Median": "—",
+                        "90% band": "—",
+                    })
                 else:
                     if granularity_shown is None:
                         granularity_shown = gran
-                    horizon_label = {"5m": "5 min", "15m": "15 min", "60m": "1 hr", "240m": "4 hr", "1440m": "24 hr"}[horizon]
+                    # Convert percentages to current-price points
+                    median_pts = r["median_pct"] / 100 * last
+                    p5_pts = r["p5_pct"] / 100 * last
+                    p95_pts = r["p95_pct"] / 100 * last
                     rows.append({
                         "Horizon": horizon_label,
                         "n": f"{r['n']:,}",
                         "% up": f"{r['pct_up']:.0f}%",
-                        "Median": f"{r['median']:+.1f}",
-                        "90% band": f"{r['p5']:+.0f} to {r['p95']:+.0f}",
+                        "Median": f"{r['median_pct']:+.2f}%  ({median_pts:+.1f} pts)",
+                        "90% band": f"{r['p5_pct']:+.2f}% to {r['p95_pct']:+.2f}%  ({p5_pts:+.0f} to {p95_pts:+.0f} pts)",
                     })
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
             if granularity_shown:
-                st.caption(f"_{granularity_shown}_")
+                st.caption(f"_{granularity_shown}  •  point values use current price {last:,.2f}_")
 
-        # Move snapshot
+        # ============================================
+        # MOVE SNAPSHOT (with clock labels)
+        # ============================================
         st.markdown("**Move snapshot**")
         w1h = window_stats(df_5m, BARS_1H)
         w4h = window_stats(df_5m, BARS_4H)
         wd = window_stats(df_5m, SESSION_BARS)
         adr = avg_daily_range(df_1d)
-        if w1h:
-            st.write(f"1hr:   {w1h['change']:+.2f} pts  •  range {w1h['range']:.2f}")
-        if w4h:
-            st.write(f"4hr:   {w4h['change']:+.2f} pts  •  range {w4h['range']:.2f}")
-        if wd:
-            avg_txt = f", avg daily: {adr:.2f}" if adr else ""
-            st.write(f"Today: {wd['change']:+.2f} pts  •  range {wd['range']:.2f}{avg_txt}")
 
-        # Trend / EMA / Volume / Range
+        if w1h:
+            t = fmt_clock(w1h["start_time"])
+            st.write(f"1hr (since {t}):  {w1h['change']:+.2f} pts ({w1h['change_pct']:+.2f}%)  •  range {w1h['range']:.2f}")
+        if w4h:
+            t = fmt_clock(w4h["start_time"])
+            st.write(f"4hr (since {t}):  {w4h['change']:+.2f} pts ({w4h['change_pct']:+.2f}%)  •  range {w4h['range']:.2f}")
+        if wd:
+            t = fmt_clock(wd["start_time"])
+            avg_txt = f", avg daily: {adr:.2f}" if adr else ""
+            st.write(f"Session (since {t}):  {wd['change']:+.2f} pts ({wd['change_pct']:+.2f}%)  •  range {wd['range']:.2f}{avg_txt}")
+
         st.markdown("**Trend by timeframe**")
         st.write(f"5min:  {trend_label(df_5m)}")
         st.write(f"1hr:   {trend_label(df_1h)}")
@@ -499,7 +535,6 @@ for i, (label, _) in enumerate(SYMBOLS.items()):
 
 st.divider()
 
-# Alignment
 st.subheader("Index alignment")
 if len(leans) == 3:
     vals = list(leans.values())
@@ -519,7 +554,7 @@ if len(leans) == 3:
 
 st.divider()
 st.caption(
-    "Phase 2  •  Base rates from 3 years of CME 5-min OHLCV data via Databento. "
-    "Probabilities reflect historical frequency under matching MACD/candle/session/volume conditions. "
+    "Phase 2.1  •  Base rates normalized to percentage returns (price-level independent). "
+    "Point equivalents shown at current price. "
     "Past performance ≠ future results."
 )
